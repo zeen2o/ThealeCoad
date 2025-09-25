@@ -226,7 +226,7 @@ def main():
     parser.add_argument('--fetch-slugs', action='store_true', help="LEVEL 2: Also download the detail JSON for every item found.")
     parser.add_argument('--fetch-links', action='store_true', help="LEVEL 3: Also read slug files and download the final link JSON for every version.")
     parser.add_argument('--workers', type=int, default=10, help="Number of concurrent downloads (default: 10).")
-    parser.add_argument('--retries', type=int, default=10, help="Number of times to retry a failed download (default: 10).")
+    parser.add_argument('--retries', type=int, default=5, help="Number of times to retry a failed download (default: 10).")
 
     args = parser.parse_args()
 
