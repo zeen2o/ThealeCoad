@@ -25,7 +25,7 @@ jobs:
           
       - name: Run Mini.py with 1-minute timeout
         run: |
-          timeout 5h55m bash run_all.sh
+          timeout 21300s bash run_all.sh
 
       - name: Commit & Push everything
         run: |
