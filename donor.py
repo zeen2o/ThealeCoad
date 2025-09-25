@@ -6,6 +6,7 @@ import sys
 import os
 from queue import Queue
 from threading import Thread, Lock
+from urllib.parse import urlparse, parse_qs
 
 # ==============================================================================
 # SCRIPT CONFIGURATION
@@ -20,7 +21,6 @@ LOG_FILE = "log.txt"
 APP_CATEGORIES = ["tools-utilities-apps", "productivity", "news-weather", "fitness-health", "antivirus-security", "wireless-network-tools", "educational-apps", "audio-video-players", "photography", "entertainment", "maps-gps", "communication", "video-editing-apps", "mobile-browsers"]
 GAME_CATEGORIES = ["action-games", "adventure-games", "casual-games", "indie-games", "racing-games", "role-playing", "sports-games", "strategy-games", "card-games", "simulation-game", "arcade-games", "puzzle-games", "board-games", "music", "educational-games"]
 
-# Thread-safe lock for writing to the log file
 LOG_LOCK = Lock()
 
 # ==============================================================================
@@ -28,7 +28,6 @@ LOG_LOCK = Lock()
 # ==============================================================================
 
 def log_failed_url(url):
-    """Safely appends a failed URL to the log file."""
     with LOG_LOCK:
         try:
             with open(LOG_FILE, 'a', encoding='utf-8') as f:
@@ -36,18 +35,43 @@ def log_failed_url(url):
         except IOError as e:
             print(f"CRITICAL: Could not write to log file {LOG_FILE}: {e}", file=sys.stderr)
 
-def get_json_response(url, retries=10, backoff_factor=0.5):
+def get_json_response(url, retries=10, backoff_factor=0.5, is_slug_url=False):
     """
-    Fetches a URL and returns its JSON response, with retries and exponential backoff.
-    Logs the URL if all retries fail.
+    Fetches a URL and returns its JSON response, with retries and special handling for slug redirects.
     """
     for attempt in range(retries):
         try:
-            response = requests.get(url, headers=HEADERS, timeout=30)
+            # For slug URLs, we handle redirects manually to capture the ID
+            response = requests.get(url, headers=HEADERS, timeout=30, allow_redirects=not is_slug_url)
+
+            # --- SPECIAL SLUG REDIRECT LOGIC ---
+            if is_slug_url and response.is_redirect:
+                location = response.headers.get('Location')
+                if location:
+                    print(f"Info: Slug URL for '{os.path.basename(url)}' redirected. Attempting to extract ID.", file=sys.stderr)
+                    parsed_location = urlparse(location)
+                    query_params = parse_qs(parsed_location.query)
+                    post_id = query_params.get('id', [None])[0]
+
+                    if post_id:
+                        new_url = f"{url}?id={post_id}"
+                        print(f"      Found ID '{post_id}'. Retrying with new URL: {new_url}", file=sys.stderr)
+                        # Make the corrected request
+                        response = requests.get(new_url, headers=HEADERS, timeout=30)
+                    else:
+                        print(f"      Warning: Redirect detected but no 'id' parameter found in location: {location}", file=sys.stderr)
+            # --- END SPECIAL LOGIC ---
+
             response.raise_for_status()
             return response.json()
+            
         except requests.exceptions.RequestException as e:
-            print(f"Warning: Attempt {attempt + 1}/{retries} failed for {url}: {e}", file=sys.stderr)
+            # Check for JSONDecodeError which can happen after a successful redirect to a non-JSON page
+            if isinstance(e, json.JSONDecodeError):
+                 print(f"Warning: Attempt {attempt + 1}/{retries} failed for {url}. Server returned non-JSON content.", file=sys.stderr)
+            else:
+                 print(f"Warning: Attempt {attempt + 1}/{retries} failed for {url}: {e}", file=sys.stderr)
+
             if attempt + 1 < retries:
                 sleep_time = backoff_factor * (2 ** attempt)
                 print(f"         Retrying in {sleep_time:.1f} seconds...", file=sys.stderr)
@@ -55,7 +79,6 @@ def get_json_response(url, retries=10, backoff_factor=0.5):
             else:
                 print(f"Error: All {retries} attempts failed for {url}. Logging it.", file=sys.stderr)
                 log_failed_url(url)
-
     return None
 
 def save_json_file(data, folder, filename):
@@ -85,13 +108,15 @@ class DownloadWorker(Thread):
             
             url, folder, filename, task_type = task
             print(f"--> Worker fetching ({task_type}): {filename}")
-            json_data = get_json_response(url, retries=self.retries)
+            
+            is_slug = (task_type == "slug")
+            json_data = get_json_response(url, retries=self.retries, is_slug_url=is_slug)
+
             if json_data:
                 save_json_file(json_data, folder, filename)
             self.queue.task_done()
 
 def start_workers(num_workers, retries):
-    """Creates and starts a pool of worker threads."""
     q = Queue()
     threads = []
     for _ in range(num_workers):
@@ -102,7 +127,6 @@ def start_workers(num_workers, retries):
     return q, threads
 
 def stop_workers(q, threads):
-    """Signals all workers to stop and waits for them to finish."""
     for _ in threads:
         q.put(None)
     for t in threads:
@@ -113,22 +137,13 @@ def stop_workers(q, threads):
 # ==============================================================================
 
 def fetch_and_process_links(slug_data, num_workers, retries):
-    """Reads a slug detail file and fetches all final download links from it."""
     post_details = slug_data.get('pageProps', {}).get('post')
     if not post_details: return
-
     downloads = post_details.get('downloads', [])
     if not downloads: return
         
     print(f"    --fetch-links active. Found {len(downloads)} versions. Fetching all link IDs...")
-
-    link_ids = []
-    for version in downloads:
-        for link in version.get('links', []):
-            link_id = link.get('id')
-            if link_id:
-                link_ids.append(link_id)
-    
+    link_ids = [link.get('id') for version in downloads for link in version.get('links', []) if link.get('id')]
     if not link_ids:
         print("    No link IDs found in this file.")
         return
@@ -145,7 +160,6 @@ def fetch_and_process_links(slug_data, num_workers, retries):
 
 
 def fetch_all_slugs_concurrently(page_data, base_path, slug_subfolder, num_workers, fetch_links_flag, retries):
-    """Uses multiple threads to download all slugs from a page's data."""
     print(f"\n--fetch-slugs active. Starting {num_workers} workers to download details concurrently.")
     posts = page_data.get('pageProps', {}).get('posts', [])
     if not posts:
@@ -182,7 +196,6 @@ def fetch_all_slugs_concurrently(page_data, base_path, slug_subfolder, num_worke
 
 
 def process_paginated_download(base_path, slug_subfolder, url_path, fetch_slugs_flag, fetch_links_flag, num_workers, retries):
-    """Main loop to download all pages."""
     page_num = 1
     next_cursor = None
     while True:
@@ -226,14 +239,13 @@ def main():
     parser.add_argument('--fetch-slugs', action='store_true', help="LEVEL 2: Also download the detail JSON for every item found.")
     parser.add_argument('--fetch-links', action='store_true', help="LEVEL 3: Also read slug files and download the final link JSON for every version.")
     parser.add_argument('--workers', type=int, default=10, help="Number of concurrent downloads (default: 10).")
-    parser.add_argument('--retries', type=int, default=5, help="Number of times to retry a failed download (default: 10).")
+    parser.add_argument('--retries', type=int, default=10, help="Number of times to retry a failed download (default: 10).")
 
     args = parser.parse_args()
 
     if args.fetch_links and not args.fetch_slugs:
         parser.error("--fetch-links requires --fetch-slugs to be active as well.")
         
-    # Inform user about the log file
     print(f"[*] Failed downloads will be logged to: {os.path.abspath(LOG_FILE)}")
 
     base_path = "android" if args.category == 'apps' else "android-games"
