@@ -24,7 +24,6 @@ NEXT_DATA_URL = f"{BASE_URL}/_next/data/{DATA_PATH_ID}"
 DOWNLOAD_API_URL = f"{BASE_URL}/api/actions/downloadlink/"
 LOG_FILE = "log.txt"
 
-# --- MAJOR CHANGE 1: More realistic browser headers to avoid being blocked ---
 HEADERS = {
     'User-Agent': 'Mozilla/5.0 (Windows NT 10.0; Win64; x64; rv:109.0) Gecko/20100101 Firefox/115.0',
     'Accept': 'application/json, text/plain, */*',
@@ -52,18 +51,16 @@ def log_failed_url(url):
         except IOError as e:
             print(f"CRITICAL: Could not write to log file {LOG_FILE}: {e}", file=sys.stderr)
 
-def _try_html_fallback(api_url):
+def _try_html_fallback(session, api_url):
     try:
-        # --- MAJOR CHANGE 2: Correctly build the HTML URL without query params ---
         base_api_url = api_url.split('?')[0]
         html_url = base_api_url.replace(f"{NEXT_DATA_URL}/", f"{BASE_URL}/").replace(".json", "")
         
         print(f"      Attempting HTML fallback: {html_url}", file=sys.stderr)
-        # Use a slightly different header for HTML page requests
-        html_headers = HEADERS.copy()
+        html_headers = session.headers.copy()
         html_headers['Accept'] = 'text/html,application/xhtml+xml,application/xml;q=0.9,image/webp,*/*;q=0.8'
         
-        response = requests.get(html_url, headers=html_headers, timeout=45)
+        response = session.get(html_url, headers=html_headers, timeout=45)
         response.raise_for_status()
 
         soup = BeautifulSoup(response.text, "lxml")
@@ -76,55 +73,62 @@ def _try_html_fallback(api_url):
             return None
     except Exception as e:
         error_msg = f"{type(e).__name__}"
-        if hasattr(e, 'response') and e.response is not None:
-            error_msg += f" (Status: {e.response.status_code})"
+        if hasattr(e, 'response') and e.response is not None: error_msg += f" (Status: {e.response.status_code})"
         print(f"      HTML fallback failed with error: {error_msg}", file=sys.stderr)
         return None
 
-def get_json_response(url, retries=5, backoff_factor=0.5, is_slug_url=False):
-    current_url = url
-    for attempt in range(retries):
-        try:
-            response = requests.get(current_url, headers=HEADERS, timeout=30, allow_redirects=False)
+def get_json_response(url, retries=10, backoff_factor=0.5, is_slug_url=False):
+    # --- MAJOR CHANGE: Use a Session object to persist cookies across redirects ---
+    with requests.Session() as s:
+        s.headers.update(HEADERS)
+        current_url = url
 
-            if is_slug_url and response.is_redirect:
-                location = response.headers.get('Location')
-                if location:
-                    parsed_location = urlparse(location)
-                    query_params = parse_qs(parsed_location.query)
-                    post_id = query_params.get('id', [None])[0]
+        for attempt in range(retries):
+            try:
+                # Use the session to make the request. Don't follow redirects automatically.
+                response = s.get(current_url, timeout=30, allow_redirects=False)
 
-                    if post_id:
-                        new_url = f"{url}?id={post_id}"
-                        if new_url != current_url:
-                            print(f"      Found ID '{post_id}'. Retrying with new URL: {new_url}", file=sys.stderr)
-                            current_url = new_url
-                        raise requests.exceptions.RetryError("Redirect with ID found, retrying.")
+                # If we get a redirect, extract the ID and restart the loop with the new URL.
+                # The session will automatically remember any cookies from the redirect response.
+                if is_slug_url and response.is_redirect:
+                    location = response.headers.get('Location')
+                    if location:
+                        parsed_location = urlparse(location)
+                        query_params = parse_qs(parsed_location.query)
+                        post_id = query_params.get('id', [None])[0]
 
-            response.raise_for_status()
-            return response.json()
-            
-        except (requests.exceptions.RequestException, json.JSONDecodeError, requests.exceptions.RetryError) as e:
-            if not isinstance(e, requests.exceptions.RetryError):
-                error_msg = f"{type(e).__name__}"
-                if hasattr(e, 'response') and e.response is not None:
-                    error_msg += f" (Status: {e.response.status_code})"
-                print(f"Warning: Attempt {attempt + 1}/{retries} failed for {current_url}: {error_msg}", file=sys.stderr)
+                        if post_id:
+                            new_url = f"{url}?id={post_id}"
+                            if new_url != current_url:
+                                print(f"      Found ID '{post_id}'. Retrying with new URL...", file=sys.stderr)
+                                current_url = new_url
+                            # Force a retry within the loop using the updated URL
+                            raise requests.exceptions.RetryError("Redirect with ID found, retrying.")
 
-            if attempt + 1 < retries:
-                sleep_time = backoff_factor * (2 ** attempt)
-                print(f"         Retrying in {sleep_time:.1f} seconds...", file=sys.stderr)
-                time.sleep(sleep_time)
-            else:
-                if is_slug_url:
-                    print(f"      All API attempts for '{os.path.basename(url)}' failed. Trying final HTML fallback.", file=sys.stderr)
-                    fallback_data = _try_html_fallback(current_url)
-                    if fallback_data:
-                        print("      SUCCESS: Extracted data from HTML fallback.", file=sys.stderr)
-                        return fallback_data
+                response.raise_for_status()
+                return response.json()
+                
+            except (requests.exceptions.RequestException, json.JSONDecodeError, requests.exceptions.RetryError) as e:
+                if not isinstance(e, requests.exceptions.RetryError):
+                    error_msg = f"{type(e).__name__}"
+                    if hasattr(e, 'response') and e.response is not None:
+                        error_msg += f" (Status: {e.response.status_code})"
+                    print(f"Warning: Attempt {attempt + 1}/{retries} failed for {current_url}: {error_msg}", file=sys.stderr)
 
-                print(f"Error: All attempts failed for the original URL {url}. Logging it.", file=sys.stderr)
-                log_failed_url(url)
+                if attempt + 1 < retries:
+                    sleep_time = backoff_factor * (2 ** (attempt + 1)) # Increase sleep time
+                    print(f"         Retrying in {sleep_time:.1f} seconds...", file=sys.stderr)
+                    time.sleep(sleep_time)
+                else:
+                    if is_slug_url:
+                        print(f"      All API attempts for '{os.path.basename(url)}' failed. Trying final HTML fallback.", file=sys.stderr)
+                        fallback_data = _try_html_fallback(s, current_url)
+                        if fallback_data:
+                            print("      SUCCESS: Extracted data from HTML fallback.", file=sys.stderr)
+                            return fallback_data
+
+                    print(f"Error: All attempts failed for the original URL {url}. Logging it.", file=sys.stderr)
+                    log_failed_url(url)
     return None
 
 def save_json_file(data, folder, filename):
@@ -137,7 +141,7 @@ def save_json_file(data, folder, filename):
         print(f"Error writing to file {filepath}: {e}", file=sys.stderr)
 
 # ==============================================================================
-# CONCURRENT DOWNLOADER LOGIC (NO CHANGES NEEDED)
+# CONCURRENT DOWNLOADER LOGIC (NO CHANGES)
 # ==============================================================================
 class DownloadWorker(Thread):
     def __init__(self, queue, retries):
@@ -152,10 +156,8 @@ class DownloadWorker(Thread):
             
             url, folder, filename, task_type = task
             print(f"--> Worker fetching ({task_type}): {filename}")
-            
             is_slug = (task_type == "slug")
             json_data = get_json_response(url, retries=self.retries, is_slug_url=is_slug)
-
             if json_data:
                 save_json_file(json_data, folder, filename)
             self.queue.task_done()
@@ -176,31 +178,23 @@ def stop_workers(q, threads):
     for t in threads:
         t.join()
 # ==============================================================================
-# CORE LOGIC FUNCTIONS (NO CHANGES NEEDED)
+# CORE LOGIC FUNCTIONS (NO CHANGES)
 # ==============================================================================
 def fetch_and_process_links(slug_data, num_workers, retries):
-    post_details = slug_data.get('props', {}).get('pageProps', {}).get('post')
-    if not post_details:
-        post_details = slug_data.get('pageProps', {}).get('post')
+    post_details = slug_data.get('props', {}).get('pageProps', {}).get('post') or slug_data.get('pageProps', {}).get('post')
     if not post_details: return
-
-    downloads = post_details.get('downloads')
-    if not downloads:
-        downloads = slug_data.get('props', {}).get('pageProps', {}).get('downloads', [])
+    downloads = post_details.get('downloads') or slug_data.get('props', {}).get('pageProps', {}).get('downloads', [])
     if not downloads: return
-        
     print(f"    --fetch-links active. Found {len(downloads)} versions. Fetching all link IDs...")
-    link_ids = [link.get('id') for version in downloads for link in version.get('links', []) if link.get('id')]
+    link_ids = [link.get('id') for v in downloads for link in v.get('links', []) if link.get('id')]
     if not link_ids:
         print("    No link IDs found in this file.")
         return
-
     q, threads = start_workers(num_workers, retries)
     for link_id in link_ids:
         url = f"{DOWNLOAD_API_URL}?id={link_id}"
         task = (url, 'downloadlink', f"{link_id}.json", "link")
         q.put(task)
-    
     q.join()
     stop_workers(q, threads)
     print(f"    Finished fetching all {len(link_ids)} link files.")
@@ -211,10 +205,8 @@ def fetch_all_slugs_concurrently(page_data, base_path, slug_subfolder, num_worke
     if not posts:
         print("Warning: No 'posts' found to process.", file=sys.stderr)
         return
-
     q, threads = start_workers(num_workers, retries)
     slug_save_path = os.path.join(base_path, slug_subfolder)
-    
     tasks = []
     for post in posts:
         item_slug = post.get('slug')
@@ -223,18 +215,15 @@ def fetch_all_slugs_concurrently(page_data, base_path, slug_subfolder, num_worke
             task = (slug_url, slug_save_path, f"{item_slug}.json", "slug")
             tasks.append(task)
             q.put(task)
-
     q.join()
     stop_workers(q, threads)
     print(f"\nFinished fetching all slug files.")
-
     if fetch_links_flag:
         for i, task_info in enumerate(tasks):
             _, folder, filename, _ = task_info
             filepath = os.path.join(folder, filename)
             try:
-                with open(filepath, 'r', encoding='utf-8') as f:
-                    slug_json_data = json.load(f)
+                with open(filepath, 'r', encoding='utf-8') as f: slug_json_data = json.load(f)
                 print(f"\n({i+1}/{len(tasks)}) Processing links inside: {filename}")
                 fetch_and_process_links(slug_json_data, num_workers, retries)
             except (FileNotFoundError, json.JSONDecodeError) as e:
@@ -247,17 +236,13 @@ def process_paginated_download(base_path, slug_subfolder, url_path, fetch_slugs_
         print("\n" + "#"*25 + f" STARTING PAGE {page_num} " + "#"*25)
         page_save_path = os.path.join(url_path, 'page')
         url = f"{NEXT_DATA_URL}/{url_path}.json?c={next_cursor}" if next_cursor else f"{NEXT_DATA_URL}/{url_path}.json"
-        
         page_data = get_json_response(url, retries=retries)
         if not page_data or not page_data.get('pageProps', {}).get('posts'):
             print(f"No more posts found or failed to fetch page data. Concluding download.")
             break
-
         save_json_file(page_data, page_save_path, f"page{page_num}.json")
-
         if fetch_slugs_flag:
             fetch_all_slugs_concurrently(page_data, base_path, slug_subfolder, num_workers, fetch_links_flag, retries)
-
         next_cursor = page_data.get('pageProps', {}).get('meta', {}).get('next_cursor')
         if not next_cursor:
             print("Reached the final page. Concluding download.")
@@ -266,51 +251,36 @@ def process_paginated_download(base_path, slug_subfolder, url_path, fetch_slugs_
         time.sleep(1)
 
 # ==============================================================================
-# MAIN EXECUTION (NO CHANGES NEEDED)
+# MAIN EXECUTION (NO CHANGES)
 # ==============================================================================
 def main():
-    parser = argparse.ArgumentParser(
-        description="Ultimate downloader for FileCR. Can fetch pages, slugs, and final download links.",
-        formatter_class=argparse.RawTextHelpFormatter
-    )
-    
+    parser = argparse.ArgumentParser(description="Ultimate downloader for FileCR. Can fetch pages, slugs, and final download links.", formatter_class=argparse.RawTextHelpFormatter)
     parser.add_argument('category', choices=['apps', 'games'], help="The base category.")
-    
     mode_group = parser.add_mutually_exclusive_group(required=True)
     mode_group.add_argument('--page', type=int, help="Download one specific page.")
     mode_group.add_argument('--all-pages', action='store_true', help="Download ALL pages.")
     mode_group.add_argument('--category-slug', type=str, help="Download ALL pages for a specific sub-category.")
-
     parser.add_argument('--fetch-slugs', action='store_true', help="LEVEL 2: Also download the detail JSON for every item found.")
     parser.add_argument('--fetch-links', action='store_true', help="LEVEL 3: Also read slug files and download the final link JSON for every version.")
     parser.add_argument('--workers', type=int, default=10, help="Number of concurrent downloads (default: 10).")
     parser.add_argument('--retries', type=int, default=10, help="Number of times to retry a failed download (default: 10).")
-
     args = parser.parse_args()
-
     if args.fetch_links and not args.fetch_slugs:
         parser.error("--fetch-links requires --fetch-slugs to be active as well.")
-        
     print(f"[*] Failed downloads will be logged to: {os.path.abspath(LOG_FILE)}")
-
     base_path = "android" if args.category == 'apps' else "android-games"
     slug_subfolder = "apps" if args.category == 'apps' else "games"
-    
     if args.category_slug:
         valid_cats = APP_CATEGORIES if args.category == 'apps' else GAME_CATEGORIES
         if args.category_slug not in valid_cats: parser.error(f"'{args.category_slug}' is not a valid slug.")
-        
         prefix = "apps" if args.category == 'apps' else ""
         url_path = os.path.join(base_path, prefix, args.category_slug).replace("\\", "/")
         process_paginated_download(base_path, slug_subfolder, url_path, args.fetch_slugs, args.fetch_links, args.workers, args.retries)
-        
     elif args.all_pages:
         process_paginated_download(base_path, slug_subfolder, base_path, args.fetch_slugs, args.fetch_links, args.workers, args.retries)
-
     elif args.page:
         page_num = args.page
         page_save_path = os.path.join(base_path, 'page')
-        
         url_to_fetch = f"{NEXT_DATA_URL}/{base_path}.json"
         if page_num > 1:
             next_cursor = None
@@ -326,7 +296,6 @@ def main():
                     return
                 time.sleep(0.5)
             url_to_fetch = f"{NEXT_DATA_URL}/{base_path}.json?c={next_cursor}"
-        
         page_data = get_json_response(url_to_fetch, retries=args.retries)
         if page_data:
             save_json_file(page_data, page_save_path, f"page{page_num}.json")
