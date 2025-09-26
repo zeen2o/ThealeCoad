@@ -112,7 +112,7 @@ def _try_html_fallback(session, api_url):
         print(f"      HTML fallback failed with error: {error_msg}", file=sys.stderr)
     return None
 
-def get_json_response(url, retries=5, backoff_factor=0.5, is_slug_url=False):
+def get_json_response(url, retries=5, backoff_factor=1, is_slug_url=False):
     with requests.Session() as s:
         header_index = 0
         s.headers.update(HEADER_LIST[header_index])
@@ -284,7 +284,7 @@ def main():
     parser.add_argument('--fetch-slugs', action='store_true', help="LEVEL 2: Also download item details.")
     parser.add_argument('--fetch-links', action='store_true', help="LEVEL 3: Also download final link details.")
     parser.add_argument('--workers', type=int, default=10, help="Concurrent downloads (default: 10).")
-    parser.add_argument('--retries', type=int, default=10, help="Retry attempts per download (default: 10).")
+    parser.add_argument('--retries', type=int, default=5, help="Retry attempts per download (default: 10).")
     args = parser.parse_args()
     if args.fetch_links and not args.fetch_slugs:
         parser.error("--fetch-links requires --fetch-slugs.")
