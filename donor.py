@@ -112,7 +112,7 @@ def _try_html_fallback(session, api_url):
         print(f"      HTML fallback failed with error: {error_msg}", file=sys.stderr)
     return None
 
-def get_json_response(url, retries=5, backoff_factor=1, is_slug_url=False):
+def get_json_response(url, retries=10, backoff_factor=1, is_slug_url=False):
     with requests.Session() as s:
         header_index = 0
         s.headers.update(HEADER_LIST[header_index])
