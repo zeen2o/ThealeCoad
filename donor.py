@@ -81,7 +81,7 @@ def _try_html_fallback(api_url):
         print(f"      HTML fallback failed with error: {error_msg}", file=sys.stderr)
         return None
 
-def get_json_response(url, retries=5, backoff_factor=5, is_slug_url=False):
+def get_json_response(url, retries=5, backoff_factor=0.5, is_slug_url=False):
     current_url = url
     for attempt in range(retries):
         try:
