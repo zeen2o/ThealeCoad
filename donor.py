@@ -24,15 +24,22 @@ NEXT_DATA_URL = f"{BASE_URL}/_next/data/{DATA_PATH_ID}"
 DOWNLOAD_API_URL = f"{BASE_URL}/api/actions/downloadlink/"
 LOG_FILE = "log.txt"
 
-HEADERS = {
-    'User-Agent': 'Mozilla/5.0 (Windows NT 10.0; Win64; x64; rv:109.0) Gecko/20100101 Firefox/115.0',
+# --- THE ULTIMATE BROWSER HEADER SET ---
+# Mimics a real Chrome browser on Windows to avoid being blocked.
+BASE_HEADERS = {
     'Accept': 'application/json, text/plain, */*',
-    'Accept-Language': 'en-US,en;q=0.5',
+    'Accept-Language': 'en-US,en;q=0.9',
+    'Connection': 'keep-alive',
     'Referer': f'{BASE_URL}/',
+    'Sec-Ch-Ua': '"Not/A)Brand";v="99", "Google Chrome";v="125", "Chromium";v="125"',
+    'Sec-Ch-Ua-Mobile': '?0',
+    'Sec-Ch-Ua-Platform': '"Windows"',
     'Sec-Fetch-Dest': 'empty',
     'Sec-Fetch-Mode': 'cors',
     'Sec-Fetch-Site': 'same-origin',
+    'User-Agent': 'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/125.0.0.0 Safari/537.36',
 }
+
 
 APP_CATEGORIES = ["tools-utilities-apps", "productivity", "news-weather", "fitness-health", "antivirus-security", "wireless-network-tools", "educational-apps", "audio-video-players", "photography", "entertainment", "maps-gps", "communication", "video-editing-apps", "mobile-browsers"]
 GAME_CATEGORIES = ["action-games", "adventure-games", "casual-games", "indie-games", "racing-games", "role-playing", "sports-games", "strategy-games", "card-games", "simulation-game", "arcade-games", "puzzle-games", "board-games", "music", "educational-games"]
@@ -57,8 +64,17 @@ def _try_html_fallback(session, api_url):
         html_url = base_api_url.replace(f"{NEXT_DATA_URL}/", f"{BASE_URL}/").replace(".json", "")
         
         print(f"      Attempting HTML fallback: {html_url}", file=sys.stderr)
+        
+        # Use headers appropriate for fetching a full HTML document
         html_headers = session.headers.copy()
-        html_headers['Accept'] = 'text/html,application/xhtml+xml,application/xml;q=0.9,image/webp,*/*;q=0.8'
+        html_headers.update({
+            'Accept': 'text/html,application/xhtml+xml,application/xml;q=0.9,image/avif,image/webp,image/apng,*/*;q=0.8,application/signed-exchange;v=b3;q=0.7',
+            'Sec-Fetch-Dest': 'document',
+            'Sec-Fetch-Mode': 'navigate',
+            'Sec-Fetch-Site': 'none',
+            'Sec-Fetch-User': '?1',
+            'Upgrade-Insecure-Requests': '1',
+        })
         
         response = session.get(html_url, headers=html_headers, timeout=45)
         response.raise_for_status()
@@ -77,19 +93,15 @@ def _try_html_fallback(session, api_url):
         print(f"      HTML fallback failed with error: {error_msg}", file=sys.stderr)
         return None
 
-def get_json_response(url, retries=10, backoff_factor=0.5, is_slug_url=False):
-    # --- MAJOR CHANGE: Use a Session object to persist cookies across redirects ---
+def get_json_response(url, retries=10, backoff_factor=1, is_slug_url=False):
     with requests.Session() as s:
-        s.headers.update(HEADERS)
+        s.headers.update(BASE_HEADERS)
         current_url = url
 
         for attempt in range(retries):
             try:
-                # Use the session to make the request. Don't follow redirects automatically.
                 response = s.get(current_url, timeout=30, allow_redirects=False)
 
-                # If we get a redirect, extract the ID and restart the loop with the new URL.
-                # The session will automatically remember any cookies from the redirect response.
                 if is_slug_url and response.is_redirect:
                     location = response.headers.get('Location')
                     if location:
@@ -98,11 +110,10 @@ def get_json_response(url, retries=10, backoff_factor=0.5, is_slug_url=False):
                         post_id = query_params.get('id', [None])[0]
 
                         if post_id:
-                            new_url = f"{url}?id={post_id}"
+                            new_url = f"{url.split('?')[0]}?id={post_id}"
                             if new_url != current_url:
                                 print(f"      Found ID '{post_id}'. Retrying with new URL...", file=sys.stderr)
                                 current_url = new_url
-                            # Force a retry within the loop using the updated URL
                             raise requests.exceptions.RetryError("Redirect with ID found, retrying.")
 
                 response.raise_for_status()
@@ -116,7 +127,7 @@ def get_json_response(url, retries=10, backoff_factor=0.5, is_slug_url=False):
                     print(f"Warning: Attempt {attempt + 1}/{retries} failed for {current_url}: {error_msg}", file=sys.stderr)
 
                 if attempt + 1 < retries:
-                    sleep_time = backoff_factor * (2 ** (attempt + 1)) # Increase sleep time
+                    sleep_time = backoff_factor * (2 ** attempt)
                     print(f"         Retrying in {sleep_time:.1f} seconds...", file=sys.stderr)
                     time.sleep(sleep_time)
                 else:
@@ -141,7 +152,7 @@ def save_json_file(data, folder, filename):
         print(f"Error writing to file {filepath}: {e}", file=sys.stderr)
 
 # ==============================================================================
-# CONCURRENT DOWNLOADER LOGIC (NO CHANGES)
+# CONCURRENT DOWNLOADER LOGIC
 # ==============================================================================
 class DownloadWorker(Thread):
     def __init__(self, queue, retries):
@@ -178,7 +189,7 @@ def stop_workers(q, threads):
     for t in threads:
         t.join()
 # ==============================================================================
-# CORE LOGIC FUNCTIONS (NO CHANGES)
+# CORE LOGIC FUNCTIONS
 # ==============================================================================
 def fetch_and_process_links(slug_data, num_workers, retries):
     post_details = slug_data.get('props', {}).get('pageProps', {}).get('post') or slug_data.get('pageProps', {}).get('post')
@@ -251,7 +262,7 @@ def process_paginated_download(base_path, slug_subfolder, url_path, fetch_slugs_
         time.sleep(1)
 
 # ==============================================================================
-# MAIN EXECUTION (NO CHANGES)
+# MAIN EXECUTION
 # ==============================================================================
 def main():
     parser = argparse.ArgumentParser(description="Ultimate downloader for FileCR. Can fetch pages, slugs, and final download links.", formatter_class=argparse.RawTextHelpFormatter)
