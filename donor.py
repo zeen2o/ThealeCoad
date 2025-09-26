@@ -8,6 +8,14 @@ from queue import Queue
 from threading import Thread, Lock
 from urllib.parse import urlparse, parse_qs
 
+# --- NEW DEPENDENCY FOR HTML PARSING ---
+try:
+    from bs4 import BeautifulSoup
+except ImportError:
+    print("Error: 'beautifulsoup4' and 'lxml' libraries are required.", file=sys.stderr)
+    print("Please install them by running: pip install beautifulsoup4 lxml", file=sys.stderr)
+    sys.exit(1)
+
 # ==============================================================================
 # SCRIPT CONFIGURATION
 # ==============================================================================
@@ -35,55 +43,84 @@ def log_failed_url(url):
         except IOError as e:
             print(f"CRITICAL: Could not write to log file {LOG_FILE}: {e}", file=sys.stderr)
 
+def _try_html_fallback(api_url):
+    """
+    Final fallback: Scrapes the HTML page to find the embedded JSON data
+    when the API endpoint itself fails.
+    """
+    try:
+        # Transform API URL to HTML page URL
+        # from: https://filecr.com/_next/data/.../android/slug.json
+        # to:   https://filecr.com/android/slug
+        html_url = api_url.replace(f"{NEXT_DATA_URL}/", f"{BASE_URL}/").replace(".json", "")
+        
+        print(f"      Attempting HTML fallback: {html_url}", file=sys.stderr)
+        response = requests.get(html_url, headers=HEADERS, timeout=45)
+        response.raise_for_status()
+
+        soup = BeautifulSoup(response.text, "lxml")
+        script_tag = soup.find("script", {"id": "__NEXT_DATA__"})
+
+        if script_tag and script_tag.string:
+            return json.loads(script_tag.string)
+        else:
+            print("      HTML fallback failed: '__NEXT_DATA__' script tag not found.", file=sys.stderr)
+            return None
+    except Exception as e:
+        print(f"      HTML fallback failed with error: {e}", file=sys.stderr)
+        return None
+
 def get_json_response(url, retries=10, backoff_factor=0.5, is_slug_url=False):
     """
-    Fetches a URL and returns its JSON response, with retries and special handling for slug redirects.
+    Fetches JSON, handling redirects and a final HTML scrape fallback for slugs.
     """
+    current_url = url
     for attempt in range(retries):
         try:
-            # For slug URLs, we handle redirects manually to capture the ID
-            response = requests.get(url, headers=HEADERS, timeout=30, allow_redirects=not is_slug_url)
+            response = requests.get(current_url, headers=HEADERS, timeout=30, allow_redirects=False)
 
-            # --- SPECIAL SLUG REDIRECT LOGIC ---
             if is_slug_url and response.is_redirect:
                 location = response.headers.get('Location')
                 if location:
-                    print(f"Info: Slug URL for '{os.path.basename(url)}' redirected. Attempting to extract ID.", file=sys.stderr)
                     parsed_location = urlparse(location)
                     query_params = parse_qs(parsed_location.query)
                     post_id = query_params.get('id', [None])[0]
 
                     if post_id:
+                        # Use the original URL with the new ID for the next attempt
                         new_url = f"{url}?id={post_id}"
-                        print(f"      Found ID '{post_id}'. Retrying with new URL: {new_url}", file=sys.stderr)
-                        # Make the corrected request
-                        response = requests.get(new_url, headers=HEADERS, timeout=30)
-                    else:
-                        print(f"      Warning: Redirect detected but no 'id' parameter found in location: {location}", file=sys.stderr)
-            # --- END SPECIAL LOGIC ---
+                        if new_url != current_url:
+                            print(f"      Found ID '{post_id}'. Retrying with new URL: {new_url}", file=sys.stderr)
+                            current_url = new_url
+                        # Rerun the request in the next loop iteration with the new URL
+                        raise requests.exceptions.RetryError("Redirect with ID found, retrying.")
 
             response.raise_for_status()
             return response.json()
             
-        except requests.exceptions.RequestException as e:
-            # Check for JSONDecodeError which can happen after a successful redirect to a non-JSON page
-            if isinstance(e, json.JSONDecodeError):
-                 print(f"Warning: Attempt {attempt + 1}/{retries} failed for {url}. Server returned non-JSON content.", file=sys.stderr)
-            else:
-                 print(f"Warning: Attempt {attempt + 1}/{retries} failed for {url}: {e}", file=sys.stderr)
+        except (requests.exceptions.RequestException, json.JSONDecodeError, requests.exceptions.RetryError) as e:
+            if not isinstance(e, requests.exceptions.RetryError):
+                 print(f"Warning: Attempt {attempt + 1}/{retries} failed for {current_url}: {type(e).__name__}", file=sys.stderr)
 
             if attempt + 1 < retries:
                 sleep_time = backoff_factor * (2 ** attempt)
                 print(f"         Retrying in {sleep_time:.1f} seconds...", file=sys.stderr)
                 time.sleep(sleep_time)
             else:
-                print(f"Error: All {retries} attempts failed for {url}. Logging it.", file=sys.stderr)
+                # --- LAST ATTEMPT FAILED ---
+                if is_slug_url:
+                    print(f"      All API attempts for '{os.path.basename(url)}' failed. Trying final HTML fallback.", file=sys.stderr)
+                    fallback_data = _try_html_fallback(url)
+                    if fallback_data:
+                        print("      SUCCESS: Extracted data from HTML fallback.", file=sys.stderr)
+                        return fallback_data
+
+                print(f"Error: All attempts failed for the original URL {url}. Logging it.", file=sys.stderr)
                 log_failed_url(url)
     return None
 
 def save_json_file(data, folder, filename):
-    if not os.path.exists(folder):
-        os.makedirs(folder)
+    os.makedirs(folder, exist_ok=True)
     filepath = os.path.join(folder, filename)
     try:
         with open(filepath, 'w', encoding='utf-8') as f:
@@ -92,7 +129,7 @@ def save_json_file(data, folder, filename):
         print(f"Error writing to file {filepath}: {e}", file=sys.stderr)
 
 # ==============================================================================
-# CONCURRENT DOWNLOADER LOGIC
+# CONCURRENT DOWNLOADER LOGIC (NO CHANGES NEEDED HERE)
 # ==============================================================================
 
 class DownloadWorker(Thread):
@@ -133,13 +170,18 @@ def stop_workers(q, threads):
         t.join()
 
 # ==============================================================================
-# CORE LOGIC FUNCTIONS
+# CORE LOGIC FUNCTIONS (NO CHANGES NEEDED HERE)
 # ==============================================================================
 
 def fetch_and_process_links(slug_data, num_workers, retries):
-    post_details = slug_data.get('pageProps', {}).get('post')
+    post_details = slug_data.get('props', {}).get('pageProps', {}).get('post')
     if not post_details: return
-    downloads = post_details.get('downloads', [])
+    
+    # Data from HTML fallback has a different structure, so we check for both
+    downloads = post_details.get('downloads')
+    if not downloads:
+        downloads = slug_data.get('props', {}).get('pageProps', {}).get('downloads', [])
+
     if not downloads: return
         
     print(f"    --fetch-links active. Found {len(downloads)} versions. Fetching all link IDs...")
@@ -221,7 +263,7 @@ def process_paginated_download(base_path, slug_subfolder, url_path, fetch_slugs_
         time.sleep(1)
 
 # ==============================================================================
-# MAIN EXECUTION
+# MAIN EXECUTION (NO CHANGES NEEDED HERE)
 # ==============================================================================
 def main():
     parser = argparse.ArgumentParser(
