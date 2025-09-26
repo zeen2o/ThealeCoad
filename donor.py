@@ -8,7 +8,6 @@ from queue import Queue
 from threading import Thread, Lock
 from urllib.parse import urlparse, parse_qs
 
-# --- NEW DEPENDENCY FOR HTML PARSING ---
 try:
     from bs4 import BeautifulSoup
 except ImportError:
@@ -23,8 +22,18 @@ DATA_PATH_ID = "hYu0sooceSMFj4KfRbxdU"
 BASE_URL = "https://filecr.com"
 NEXT_DATA_URL = f"{BASE_URL}/_next/data/{DATA_PATH_ID}"
 DOWNLOAD_API_URL = f"{BASE_URL}/api/actions/downloadlink/"
-HEADERS = {'User-Agent': 'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/91.0.4472.124 Safari/5736'}
 LOG_FILE = "log.txt"
+
+# --- MAJOR CHANGE 1: More realistic browser headers to avoid being blocked ---
+HEADERS = {
+    'User-Agent': 'Mozilla/5.0 (Windows NT 10.0; Win64; x64; rv:109.0) Gecko/20100101 Firefox/115.0',
+    'Accept': 'application/json, text/plain, */*',
+    'Accept-Language': 'en-US,en;q=0.5',
+    'Referer': f'{BASE_URL}/',
+    'Sec-Fetch-Dest': 'empty',
+    'Sec-Fetch-Mode': 'cors',
+    'Sec-Fetch-Site': 'same-origin',
+}
 
 APP_CATEGORIES = ["tools-utilities-apps", "productivity", "news-weather", "fitness-health", "antivirus-security", "wireless-network-tools", "educational-apps", "audio-video-players", "photography", "entertainment", "maps-gps", "communication", "video-editing-apps", "mobile-browsers"]
 GAME_CATEGORIES = ["action-games", "adventure-games", "casual-games", "indie-games", "racing-games", "role-playing", "sports-games", "strategy-games", "card-games", "simulation-game", "arcade-games", "puzzle-games", "board-games", "music", "educational-games"]
@@ -44,18 +53,17 @@ def log_failed_url(url):
             print(f"CRITICAL: Could not write to log file {LOG_FILE}: {e}", file=sys.stderr)
 
 def _try_html_fallback(api_url):
-    """
-    Final fallback: Scrapes the HTML page to find the embedded JSON data
-    when the API endpoint itself fails.
-    """
     try:
-        # Transform API URL to HTML page URL
-        # from: https://filecr.com/_next/data/.../android/slug.json
-        # to:   https://filecr.com/android/slug
-        html_url = api_url.replace(f"{NEXT_DATA_URL}/", f"{BASE_URL}/").replace(".json", "")
+        # --- MAJOR CHANGE 2: Correctly build the HTML URL without query params ---
+        base_api_url = api_url.split('?')[0]
+        html_url = base_api_url.replace(f"{NEXT_DATA_URL}/", f"{BASE_URL}/").replace(".json", "")
         
         print(f"      Attempting HTML fallback: {html_url}", file=sys.stderr)
-        response = requests.get(html_url, headers=HEADERS, timeout=45)
+        # Use a slightly different header for HTML page requests
+        html_headers = HEADERS.copy()
+        html_headers['Accept'] = 'text/html,application/xhtml+xml,application/xml;q=0.9,image/webp,*/*;q=0.8'
+        
+        response = requests.get(html_url, headers=html_headers, timeout=45)
         response.raise_for_status()
 
         soup = BeautifulSoup(response.text, "lxml")
@@ -67,13 +75,13 @@ def _try_html_fallback(api_url):
             print("      HTML fallback failed: '__NEXT_DATA__' script tag not found.", file=sys.stderr)
             return None
     except Exception as e:
-        print(f"      HTML fallback failed with error: {e}", file=sys.stderr)
+        error_msg = f"{type(e).__name__}"
+        if hasattr(e, 'response') and e.response is not None:
+            error_msg += f" (Status: {e.response.status_code})"
+        print(f"      HTML fallback failed with error: {error_msg}", file=sys.stderr)
         return None
 
-def get_json_response(url, retries=10, backoff_factor=0.5, is_slug_url=False):
-    """
-    Fetches JSON, handling redirects and a final HTML scrape fallback for slugs.
-    """
+def get_json_response(url, retries=5, backoff_factor=5, is_slug_url=False):
     current_url = url
     for attempt in range(retries):
         try:
@@ -87,12 +95,10 @@ def get_json_response(url, retries=10, backoff_factor=0.5, is_slug_url=False):
                     post_id = query_params.get('id', [None])[0]
 
                     if post_id:
-                        # Use the original URL with the new ID for the next attempt
                         new_url = f"{url}?id={post_id}"
                         if new_url != current_url:
                             print(f"      Found ID '{post_id}'. Retrying with new URL: {new_url}", file=sys.stderr)
                             current_url = new_url
-                        # Rerun the request in the next loop iteration with the new URL
                         raise requests.exceptions.RetryError("Redirect with ID found, retrying.")
 
             response.raise_for_status()
@@ -100,17 +106,19 @@ def get_json_response(url, retries=10, backoff_factor=0.5, is_slug_url=False):
             
         except (requests.exceptions.RequestException, json.JSONDecodeError, requests.exceptions.RetryError) as e:
             if not isinstance(e, requests.exceptions.RetryError):
-                 print(f"Warning: Attempt {attempt + 1}/{retries} failed for {current_url}: {type(e).__name__}", file=sys.stderr)
+                error_msg = f"{type(e).__name__}"
+                if hasattr(e, 'response') and e.response is not None:
+                    error_msg += f" (Status: {e.response.status_code})"
+                print(f"Warning: Attempt {attempt + 1}/{retries} failed for {current_url}: {error_msg}", file=sys.stderr)
 
             if attempt + 1 < retries:
                 sleep_time = backoff_factor * (2 ** attempt)
                 print(f"         Retrying in {sleep_time:.1f} seconds...", file=sys.stderr)
                 time.sleep(sleep_time)
             else:
-                # --- LAST ATTEMPT FAILED ---
                 if is_slug_url:
                     print(f"      All API attempts for '{os.path.basename(url)}' failed. Trying final HTML fallback.", file=sys.stderr)
-                    fallback_data = _try_html_fallback(url)
+                    fallback_data = _try_html_fallback(current_url)
                     if fallback_data:
                         print("      SUCCESS: Extracted data from HTML fallback.", file=sys.stderr)
                         return fallback_data
@@ -129,9 +137,8 @@ def save_json_file(data, folder, filename):
         print(f"Error writing to file {filepath}: {e}", file=sys.stderr)
 
 # ==============================================================================
-# CONCURRENT DOWNLOADER LOGIC (NO CHANGES NEEDED HERE)
+# CONCURRENT DOWNLOADER LOGIC (NO CHANGES NEEDED)
 # ==============================================================================
-
 class DownloadWorker(Thread):
     def __init__(self, queue, retries):
         Thread.__init__(self)
@@ -168,20 +175,18 @@ def stop_workers(q, threads):
         q.put(None)
     for t in threads:
         t.join()
-
 # ==============================================================================
-# CORE LOGIC FUNCTIONS (NO CHANGES NEEDED HERE)
+# CORE LOGIC FUNCTIONS (NO CHANGES NEEDED)
 # ==============================================================================
-
 def fetch_and_process_links(slug_data, num_workers, retries):
     post_details = slug_data.get('props', {}).get('pageProps', {}).get('post')
+    if not post_details:
+        post_details = slug_data.get('pageProps', {}).get('post')
     if not post_details: return
-    
-    # Data from HTML fallback has a different structure, so we check for both
+
     downloads = post_details.get('downloads')
     if not downloads:
         downloads = slug_data.get('props', {}).get('pageProps', {}).get('downloads', [])
-
     if not downloads: return
         
     print(f"    --fetch-links active. Found {len(downloads)} versions. Fetching all link IDs...")
@@ -199,7 +204,6 @@ def fetch_and_process_links(slug_data, num_workers, retries):
     q.join()
     stop_workers(q, threads)
     print(f"    Finished fetching all {len(link_ids)} link files.")
-
 
 def fetch_all_slugs_concurrently(page_data, base_path, slug_subfolder, num_workers, fetch_links_flag, retries):
     print(f"\n--fetch-slugs active. Starting {num_workers} workers to download details concurrently.")
@@ -236,7 +240,6 @@ def fetch_all_slugs_concurrently(page_data, base_path, slug_subfolder, num_worke
             except (FileNotFoundError, json.JSONDecodeError) as e:
                 print(f"Warning: Could not read or process {filepath}. {e}", file=sys.stderr)
 
-
 def process_paginated_download(base_path, slug_subfolder, url_path, fetch_slugs_flag, fetch_links_flag, num_workers, retries):
     page_num = 1
     next_cursor = None
@@ -263,7 +266,7 @@ def process_paginated_download(base_path, slug_subfolder, url_path, fetch_slugs_
         time.sleep(1)
 
 # ==============================================================================
-# MAIN EXECUTION (NO CHANGES NEEDED HERE)
+# MAIN EXECUTION (NO CHANGES NEEDED)
 # ==============================================================================
 def main():
     parser = argparse.ArgumentParser(
