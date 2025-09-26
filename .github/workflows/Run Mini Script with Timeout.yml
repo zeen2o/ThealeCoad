@@ -23,7 +23,7 @@ jobs:
           python -m pip install --upgrade pip
           pip install beautifulsoup4 lxml requests
           
-      - name: Run Mini.py with 1-minute timeout
+      - name: Run Mini.py with timeout
         run: |
           timeout 21300s bash run_all.sh
 
