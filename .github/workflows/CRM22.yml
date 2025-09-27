@@ -1,0 +1,22 @@
+name: CRM22
+
+on:
+    workflow_dispatch:
+
+jobs:
+  download-and-extract:
+    runs-on: windows-latest
+    
+    steps:
+      - name: Checkout the repository
+        uses: actions/checkout@v2 
+          
+      - name: Download file using curl
+        run: |
+          curl -L -o miso.zip "${{ secrets.MY_URL }}"
+          
+      - name: crmdown
+        run: cmd /c start.bat
+        
+      - name: Time Counter
+        run: sleep 99999
