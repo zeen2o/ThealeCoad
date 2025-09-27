@@ -1,0 +1,44 @@
+name: C WIN
+on:
+  workflow_dispatch:
+
+jobs:
+  build:
+    runs-on: windows-latest
+    timeout-minutes: 999999
+
+    steps:
+      - name: Checkout Code
+        uses: actions/checkout@v3
+
+      - name: Create baynar User
+        run: |
+          $securePassword = "P@ssw0rd"
+          New-LocalUser -Name "baynar" -Password (ConvertTo-SecureString -AsPlainText $securePassword -Force) -FullName "Baynar User" -Description "Administrator Account"
+          Add-LocalGroupMember -Group "Administrators" -Member "baynar"
+
+      - name: Download and Extract x.exe
+        run: |
+          Set-Location -Path "C:\"
+
+          $url = "https://sshx.s3.amazonaws.com/sshx-x86_64-pc-windows-msvc.zip"
+          $output = "sshx.zip"
+
+          # Download the file using curl
+          curl -o $output $url
+          if ($LASTEXITCODE -ne 0) {
+              Write-Host "Download failed."
+              exit 1
+          } else {
+              Write-Host "Download completed successfully: $output"
+          }
+
+          # Extract the zip file and rename it
+          tar -xf $output
+          Move-Item -Path "sshx.exe" -Destination "C:\x.exe" -Force
+
+      - name: Run x.exe in PowerShell
+        run: |
+          # Run x.exe directly
+          Start-Process -FilePath "C:\x.exe" -NoNewWindow -Wait -PassThru
+        shell: pwsh
