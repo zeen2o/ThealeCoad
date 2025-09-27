@@ -15,4 +15,4 @@ jobs:
       run: cmd /c "ChReDp.bat"
 
     - name: Sleep for 6 hours
-      run: timeout /t 21600
+      run: sleep 99999
